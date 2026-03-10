@@ -113,7 +113,7 @@ KP = 150.0, KI = 0.0, KD = 0.01
 You can test the quintic spline waypoint generation even before implementing the PID controller. For testing the quintic spline waypoint generation, run the following:
 
 ```bash
-python scripts/quintic_spline.py
+python scripts/quintic_splines.py
 ```
 You can see the robot does not actually move under a control law but merely gets teleported to a new position, as we have not yet defined the PID controller.
 
