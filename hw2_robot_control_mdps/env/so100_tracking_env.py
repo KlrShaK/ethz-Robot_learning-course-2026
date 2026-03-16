@@ -38,6 +38,16 @@ class SO100TrackEnv(gym.Env):
 
         # Evaluation metrics
         self.ee_tracking_error = 0.0
+        self.prev_ee_tracking_error = None
+        self.prev_ctrl_target = None
+
+        # Keep reward terms explicit so the shaping is easy to read and tune.
+        self.progress_weight = 20.0
+        self.error_weight = 3.0
+        self.jerk_weight = 0.01
+        self.velocity_weight = 0.001
+        self.success_bonus = 1.0
+        self.success_threshold = 5e-3
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed, options=options)
@@ -50,6 +60,12 @@ class SO100TrackEnv(gym.Env):
         # Reset target position around robot base
         base_pos = self.data.body("Base").xpos.copy()
         self.data.mocap_pos[0] = reset_target_position(base_pos)
+        mujoco.mj_forward(self.model, self.data)
+
+        self.ee_tracking_error = np.linalg.norm(self.data.site("ee_site").xpos - self.data.mocap_pos[0])
+        # Store previous-step values so reward can compare motion over time.
+        self.prev_ee_tracking_error = self.ee_tracking_error
+        self.prev_ctrl_target = None
 
         self.current_step = 0
         return self._get_obs(), {}
@@ -57,15 +73,32 @@ class SO100TrackEnv(gym.Env):
     def _process_action(self, action):
         return process_action(action, self.model.jnt_range)
 
-    def compute_reward(self):
-        return compute_reward(self.ee_tracking_error)
+    def compute_reward(self, ctrl_target):
+        curr_error = self.ee_tracking_error
+        prev_error = self.prev_ee_tracking_error if self.prev_ee_tracking_error is not None else curr_error
+
+        # Reward progress toward the target instead of only rewarding the final distance.
+        progress_reward = self.progress_weight * (prev_error - curr_error)
+        error_penalty = -self.error_weight * curr_error
+
+        # Penalize abrupt control target changes to discourage jerky motion.
+        jerk_penalty = 0.0
+        if self.prev_ctrl_target is not None:
+            jerk_penalty = -self.jerk_weight * np.sum((ctrl_target - self.prev_ctrl_target) ** 2)
+
+        velocity_penalty = -self.velocity_weight * np.sum(self.data.qvel[:] ** 2)
+        success_reward = self.success_bonus if curr_error < self.success_threshold else 0.0
+        return progress_reward + error_penalty + jerk_penalty + velocity_penalty + success_reward
 
     def step(self, action):
-        self.data.ctrl[:] = self._process_action(action)
+        ctrl_target = self._process_action(action)
+        self.data.ctrl[:] = ctrl_target
         for _ in range(self.ctrl_decimation): 
             mujoco.mj_step(self.model, self.data)
         self.ee_tracking_error = np.linalg.norm(self.data.site("ee_site").xpos - self.data.mocap_pos[0])
-        reward = self.compute_reward()
+        reward = self.compute_reward(ctrl_target)
+        self.prev_ee_tracking_error = self.ee_tracking_error
+        self.prev_ctrl_target = ctrl_target.copy()
 
         terminated = False
         truncated = False
