@@ -2,3 +2,9 @@ hw2_robot_control_mdps/so101_gym.egg-info/dependency_links.txt
 hw2_robot_control_mdps/so101_gym.egg-info/SOURCES.txt
 hw2_robot_control_mdps/so101_gym.egg-info/PKG-INFO
 hw2_robot_control_mdps/so101_gym.egg-info/top_level.txt
+hw3_imitation_learning/hw3/__pycache__/*
+hw3_imitation_learning/hw3_imitation_learning.egg-info/*
+hw3_imitation_learning/so101_gym/__pycache__/*
+
+
+hw3_imitation_learning/datasets/*

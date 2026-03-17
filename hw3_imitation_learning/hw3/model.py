@@ -42,25 +42,57 @@ class ObstaclePolicy(BasePolicy):
 
     def __init__(
         self,
+        state_dim: int, 
+        action_dim: int, 
+        chunk_size: int, 
+        d_model: int = 128, 
+        depth: int = 3
     ) -> None:
-        super().__init__()
+        super().__init__(state_dim, action_dim, chunk_size)
+
+        if depth < 1:
+            raise ValueError("depth must be >= 1")
+
+        self.d_model = d_model
+        self.depth = depth    
+
+        layers: list[nn.Module] = [
+                nn.Linear(state_dim, d_model),
+                nn.ReLU(),
+            ]
+
+        for _ in range(depth - 1):
+            layers.extend(
+                [
+                    nn.Linear(d_model, d_model),
+                    nn.ReLU(),
+                ]
+            )
+
+        layers.append(nn.Linear(d_model, chunk_size * action_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(
         self,
+        state: torch.Tensor,
     ) -> torch.Tensor:
         """Return predicted action chunk of shape (B, chunk_size, action_dim)."""
-        raise NotImplementedError
+        out = self.net(state)
+        return out.view(-1, self.chunk_size, self.action_dim)
 
     def compute_loss(
         self,
+        state: torch.Tensor,
+        action_chunk: torch.Tensor,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        pred = self.forward(state)
+        return nn.functional.mse_loss(pred, action_chunk)
 
     def sample_actions(
         self,
         state: torch.Tensor,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        return self.forward(state)
 
 
 # TODO: Students implement MultiTaskPolicy here.
