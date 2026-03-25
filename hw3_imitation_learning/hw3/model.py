@@ -9,6 +9,10 @@ import torch
 from torch import nn
 
 
+DEFAULT_D_MODEL = 256
+DEFAULT_DEPTH = 5
+
+
 class BasePolicy(nn.Module, metaclass=abc.ABCMeta):
     """Base class for action chunking policies."""
 
@@ -32,96 +36,108 @@ class BasePolicy(nn.Module, metaclass=abc.ABCMeta):
         """Generate a chunk of actions with shape (batch, chunk_size, action_dim)."""
 
 
-# TODO: Students implement ObstaclePolicy here.
-class ObstaclePolicy(BasePolicy):
-    """Predicts action chunks with an MSE loss.
+def _init_linear(linear: nn.Linear) -> None:
+    nn.init.xavier_uniform_(linear.weight)
+    nn.init.zeros_(linear.bias)
 
-    A simple MLP that maps a state vector to a flat action chunk
-    (chunk_size * action_dim) and reshapes to (B, chunk_size, action_dim).
-    """
+
+class ResidualMLPBlock(nn.Module):
+    """Pre-norm residual block for low-dimensional state inputs."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.fc1 = nn.Linear(d_model, d_model)
+        self.act = nn.SiLU()
+        self.fc2 = nn.Linear(d_model, d_model)
+
+        _init_linear(self.fc1)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return residual + x
+
+
+class ObstaclePolicy(BasePolicy):
+    """Residual MLP policy for single-cube obstacle imitation learning."""
 
     def __init__(
         self,
-        state_dim: int, 
-        action_dim: int, 
-        chunk_size: int, 
-        d_model: int = 128, 
-        depth: int = 3
+        state_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        d_model: int = DEFAULT_D_MODEL,
+        depth: int = DEFAULT_DEPTH,
     ) -> None:
         super().__init__(state_dim, action_dim, chunk_size)
 
+        if d_model < 32:
+            raise ValueError('d_model must be >= 32')
         if depth < 1:
-            raise ValueError("depth must be >= 1")
+            raise ValueError('depth must be >= 1')
 
         self.d_model = d_model
-        self.depth = depth    
+        self.depth = depth
 
-        layers: list[nn.Module] = [
-                nn.Linear(state_dim, d_model),
-                nn.ReLU(),
-            ]
+        self.input_proj = nn.Linear(state_dim, d_model)
+        self.input_norm = nn.LayerNorm(d_model)
+        self.blocks = nn.ModuleList([ResidualMLPBlock(d_model) for _ in range(depth)])
+        self.output_norm = nn.LayerNorm(d_model)
+        self.output_proj = nn.Linear(d_model, chunk_size * action_dim)
 
-        for _ in range(depth - 1):
-            layers.extend(
-                [
-                    nn.Linear(d_model, d_model),
-                    nn.ReLU(),
-                ]
-            )
-
-        layers.append(nn.Linear(d_model, chunk_size * action_dim))
-        self.net = nn.Sequential(*layers)
+        _init_linear(self.input_proj)
+        _init_linear(self.output_proj)
 
     def forward(
         self,
         state: torch.Tensor,
     ) -> torch.Tensor:
         """Return predicted action chunk of shape (B, chunk_size, action_dim)."""
-        out = self.net(state)
-        return out.view(-1, self.chunk_size, self.action_dim)
+        squeeze_batch = state.ndim == 1
+        if squeeze_batch:
+            state = state.unsqueeze(0)
+        if state.ndim != 2:
+            raise ValueError(f'Expected state with shape (B, D), got {tuple(state.shape)}')
+
+        x = self.input_proj(state)
+        x = nn.functional.silu(self.input_norm(x))
+        for block in self.blocks:
+            x = block(x)
+        x = self.output_norm(x)
+        out = self.output_proj(x)
+        out = out.reshape(state.shape[0], self.chunk_size, self.action_dim)
+        return out.squeeze(0) if squeeze_batch else out
 
     def compute_loss(
         self,
         state: torch.Tensor,
         action_chunk: torch.Tensor,
     ) -> torch.Tensor:
-        pred = self.forward(state)
+        pred = self(state)
         return nn.functional.mse_loss(pred, action_chunk)
 
     def sample_actions(
         self,
         state: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward(state)
+        return self(state)
 
 
-# TODO: Students implement MultiTaskPolicy here.
-class MultiTaskPolicy(BasePolicy):
-    """Goal-conditioned policy for the multicube scene."""
+class MultiTaskPolicy(ObstaclePolicy):
+    """Goal-conditioned policy for the multicube scene.
 
-    def __init__(
-        self,
-    ) -> None:
-        super().__init__()
-
-    def compute_loss(
-        self,
-    ) -> torch.Tensor:
-        raise NotImplementedError
-
-    def sample_actions(
-        self,
-    ) -> torch.Tensor:
-        raise NotImplementedError
-
-    def forward(
-        self,
-    ) -> torch.Tensor:
-        """Return predicted action chunk of shape (B, chunk_size, action_dim)."""
-        raise NotImplementedError
+    The goal information is assumed to be part of the input state vector,
+    so the same residual MLP architecture works well here too.
+    """
 
 
-PolicyType: TypeAlias = Literal["obstacle", "multitask"]
+PolicyType: TypeAlias = Literal['obstacle', 'multitask']
 
 
 def build_policy(
@@ -129,17 +145,24 @@ def build_policy(
     *,
     state_dim: int,
     action_dim: int,
+    chunk_size: int = 16,
+    d_model: int = DEFAULT_D_MODEL,
+    depth: int = DEFAULT_DEPTH,
 ) -> BasePolicy:
-    if policy_type == "obstacle":
+    if policy_type == 'obstacle':
         return ObstaclePolicy(
-            action_dim=action_dim,
             state_dim=state_dim,
-            # TODO: Build with your chosen specifications
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            d_model=d_model,
+            depth=depth,
         )
-    if policy_type == "multitask":
+    if policy_type == 'multitask':
         return MultiTaskPolicy(
-            action_dim=action_dim,
             state_dim=state_dim,
-            # TODO: Build with your chosen specifications
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            d_model=d_model,
+            depth=depth,
         )
-    raise ValueError(f"Unknown policy type: {policy_type}")
+    raise ValueError(f'Unknown policy type: {policy_type}')

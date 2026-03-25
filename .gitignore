@@ -5,6 +5,8 @@ hw2_robot_control_mdps/so101_gym.egg-info/top_level.txt
 hw3_imitation_learning/hw3/__pycache__/*
 hw3_imitation_learning/hw3_imitation_learning.egg-info/*
 hw3_imitation_learning/so101_gym/__pycache__/*
+hw3_imitation_learning/scripts/__pycache__/*
 
-
-hw3_imitation_learning/datasets/*
+hw3_imitation_learning/datasets/
+hw3_imitation_learning/Archive/
+hw3_imitation_learning/checkpoints/

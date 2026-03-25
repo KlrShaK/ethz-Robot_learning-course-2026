@@ -72,9 +72,9 @@
     "description": "Rotate EE -Z axis"
   },
   "gripper_open": {
-    "raw": 111,
-    "ascii": 111,
-    "label": "o",
+    "raw": 118,
+    "ascii": 118,
+    "label": "v",
     "description": "Open gripper (Jaw +)"
   },
   "gripper_close": {
