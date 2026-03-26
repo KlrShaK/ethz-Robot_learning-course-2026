@@ -186,7 +186,7 @@ This multicube goal-conditioned problem is **significantly harder** than the pre
 #### Deliverable
 When you're confident about your model performance you can run 
 ```bash
-python student_eval/run_eval --exercise 3 --checkpoint <path to your ckpt>
+python student_eval/run_eval.py --exercise 3 --checkpoint <path to your ckpt>
 ```
 This will produce a file named ex3_result.hwresult which you can submit to the autograder on gradescope. Do NOT modify this file as we will verify your performance reported to gradescope on our side as well.
 Submit your `model.py` and your best checkpoint `.pt` file to the autograder. Please name the checkpoint file `ex3.pt`. Please don't change the name of the `MultiTaskPolicy` class as this is imported by the autograder. Make sure there is no mismatch between the default init of the class and the checkpoint you submitted. 
