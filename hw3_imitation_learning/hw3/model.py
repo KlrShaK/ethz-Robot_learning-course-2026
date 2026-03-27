@@ -9,8 +9,9 @@ import torch
 from torch import nn
 
 
-DEFAULT_D_MODEL = 256
+DEFAULT_D_MODEL = 128
 DEFAULT_DEPTH = 5
+DROPOUT_P = 0.5
 
 
 class BasePolicy(nn.Module, metaclass=abc.ABCMeta):
@@ -49,6 +50,7 @@ class ResidualMLPBlock(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.fc1 = nn.Linear(d_model, d_model)
         self.act = nn.SiLU()
+        self.dropout = nn.Dropout(DROPOUT_P)
         self.fc2 = nn.Linear(d_model, d_model)
 
         _init_linear(self.fc1)
@@ -60,6 +62,7 @@ class ResidualMLPBlock(nn.Module):
         x = self.norm(x)
         x = self.fc1(x)
         x = self.act(x)
+        x = self.dropout(x)
         x = self.fc2(x)
         return residual + x
 
