@@ -17,8 +17,10 @@ from pathlib import Path
 import torch
 import zarr as zarr_lib
 from hw3.dataset import (
+    ColorPermutationAugmentedDataset,
     Normalizer,
     SO100ChunkDataset,
+    build_color_permutation_spec,
     load_and_merge_zarrs,
     load_zarr,
 )
@@ -26,14 +28,95 @@ from hw3.model import BasePolicy, build_policy
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, random_split
 
-EPOCHS = 200
+EPOCHS = 1000
 BATCH_SIZE = 256
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
-VAL_SPLIT = 0.1
+VAL_SPLIT = 0.2 # try 0.2
 GRAD_CLIP_NORM = 1.0
-DEFAULT_D_MODEL = 256
-DEFAULT_DEPTH = 5  # 5
+DEFAULT_D_MODEL = 256 # 128
+DEFAULT_DEPTH = 5  # 3
+EARLY_STOPPING_PATIENCE = 20
+
+
+def load_checkpoint_metadata(ckpt_path: Path, device: torch.device) -> dict:
+    """Load checkpoint metadata for model construction or initialization."""
+    return torch.load(ckpt_path, map_location=device, weights_only=False)
+
+
+def resolve_model_hparams(
+    args: argparse.Namespace,
+    checkpoint_meta: dict | None,
+) -> tuple[int, int]:
+    """Choose model width/depth, preferring explicit args over checkpoint metadata."""
+    if args.d_model is not None:
+        d_model = args.d_model
+    elif checkpoint_meta is not None and "d_model" in checkpoint_meta:
+        d_model = int(checkpoint_meta["d_model"])
+    else:
+        d_model = DEFAULT_D_MODEL
+
+    if args.depth is not None:
+        depth = args.depth
+    elif checkpoint_meta is not None and "depth" in checkpoint_meta:
+        depth = int(checkpoint_meta["depth"])
+    else:
+        depth = DEFAULT_DEPTH
+
+    return d_model, depth
+
+
+def initialize_model_from_checkpoint(
+    model: BasePolicy,
+    checkpoint: dict,
+    *,
+    load_mode: str,
+) -> None:
+    """Initialize model weights from a checkpoint."""
+    state_dict = checkpoint["model_state_dict"]
+    if load_mode == "exact":
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            raise ValueError(
+                "Exact checkpoint loading failed. If you are finetuning across "
+                "different state dimensions, use "
+                "--checkpoint-load-mode compatible."
+            ) from exc
+        print("Loaded model weights from checkpoint (exact).")
+        return
+
+    if load_mode != "compatible":
+        raise ValueError(f"Unknown checkpoint load mode: {load_mode}")
+
+    model_state = model.state_dict()
+    compatible: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
+
+    for key, value in state_dict.items():
+        target = model_state.get(key)
+        if target is None or target.shape != value.shape:
+            skipped.append(key)
+            continue
+        compatible[key] = value
+
+    if not compatible:
+        raise ValueError(
+            "No compatible weights could be loaded from the checkpoint. "
+            "Check d_model/depth/chunk_size/action space compatibility."
+        )
+
+    model.load_state_dict(compatible, strict=False)
+    print(
+        "Loaded compatible checkpoint weights: "
+        f"{len(compatible)}/{len(model_state)} tensors matched."
+    )
+    if skipped:
+        print(f"  Skipped mismatched tensors: {', '.join(skipped)}")
+
+    left_fresh = sorted(set(model_state) - set(compatible))
+    if left_fresh:
+        print(f"  Left at fresh init: {', '.join(left_fresh)}")
 
 
 def train_one_epoch(
@@ -131,16 +214,28 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help=f"Batch size (default: {BATCH_SIZE}).")
     parser.add_argument("--lr", type=float, default=LR, help=f"Learning rate (default: {LR}).")
     parser.add_argument(
+        "--d-model",
+        type=int,
+        default=None,
+        help="Hidden width. Defaults to the checkpoint value when --checkpoint is set, otherwise the script default.",
+    )
+    parser.add_argument(
         "--depth",
         type=int,
-        default=DEFAULT_DEPTH,
-        help=f"Number of residual MLP blocks (default: {DEFAULT_DEPTH}).",
+        default=None,
+        help="Number of residual MLP blocks. Defaults to the checkpoint value when --checkpoint is set, otherwise the script default.",
     )
     parser.add_argument(
         "--num-workers",
         type=int,
         default=0,
         help="DataLoader workers (default: 0).",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=EARLY_STOPPING_PATIENCE,
+        help=f"Early stopping patience in epochs without validation improvement (default: {EARLY_STOPPING_PATIENCE}).",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
@@ -149,13 +244,30 @@ def main() -> None:
         default=None,
         help="Path to a checkpoint file to initialize model weights from.",
     )
+    parser.add_argument(
+        "--checkpoint-load-mode",
+        choices=["exact", "compatible"],
+        default="exact",
+        help="How to load --checkpoint weights: 'exact' for full resume, 'compatible' for partial finetuning when shapes differ.",
+    )
+    parser.add_argument(
+        "--multicube-color-augment",
+        action="store_true",
+        help="Enable train-only virtual 6x color-permutation augmentation for multicube state inputs.",
+    )
     args = parser.parse_args()
 
     if args.epochs < 1:
         raise ValueError("--epochs must be >= 1")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
-    if not 0.0 <= args.val_split < 1.0:
+    if args.d_model is not None and args.d_model < 32:
+        raise ValueError("--d-model must be >= 32")
+    if args.depth is not None and args.depth < 1:
+        raise ValueError("--depth must be >= 1")
+    if args.patience < 1:
+        raise ValueError("--patience must be >= 1")
+    if not 0.0 <= VAL_SPLIT < 1.0:
         raise ValueError("--val-split must be in [0, 1)")
 
     torch.manual_seed(args.seed)
@@ -165,6 +277,17 @@ def main() -> None:
             torch.set_float32_matmul_precision("high")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    checkpoint_meta: dict | None = None
+    if args.checkpoint is not None:
+        checkpoint_meta = load_checkpoint_metadata(args.checkpoint, device)
+        print(
+            "Checkpoint init source: "
+            f"{args.checkpoint} "
+            f"(policy={checkpoint_meta.get('policy_type', '?')}, "
+            f"d_model={checkpoint_meta.get('d_model', '?')}, "
+            f"depth={checkpoint_meta.get('depth', '?')})"
+        )
 
     # ── load data ─────────────────────────────────────────────────────
     zarr_paths = [args.zarr]
@@ -186,8 +309,13 @@ def main() -> None:
         )
 
     ref_zarr = zarr_lib.open_group(str(zarr_paths[0]), mode="r")
+    data_group = ref_zarr["data"]
     state_keys = args.state_keys or [str(ref_zarr.attrs.get("state_key", "state"))]
     action_keys = args.action_keys or [str(ref_zarr.attrs.get("action_key", "action"))]
+    state_key_widths = {
+        name: int(data_group[name].shape[1])
+        for name in {spec.split("[", 1)[0] for spec in state_keys}
+    }
 
     normalizer = Normalizer.from_data(states, actions)
 
@@ -214,6 +342,20 @@ def main() -> None:
     )
     print(f"  train_samples={n_train}, val_samples={n_val}")
 
+    data_augmentation: dict[str, str] = {}
+    if args.multicube_color_augment:
+        color_spec = build_color_permutation_spec(state_keys, state_key_widths)
+        train_ds = ColorPermutationAugmentedDataset(
+            train_ds,
+            spec=color_spec,
+            normalizer=normalizer,
+        )
+        data_augmentation["multicube_color_permutation"] = "virtual_6x"
+        print("  multicube_color_augment=enabled (virtual x6 train-set expansion)")
+        print(f"  effective_train_samples={len(train_ds)}")
+    else:
+        print("  multicube_color_augment=disabled")
+
     pin_memory = device.type == "cuda"
     train_loader = DataLoader(
         train_ds,
@@ -233,19 +375,23 @@ def main() -> None:
     )
 
     # ── model ─────────────────────────────────────────────────────────
+    d_model, depth = resolve_model_hparams(args, checkpoint_meta)
     model = build_policy(
         args.policy,
         state_dim=states.shape[1],
         action_dim=actions.shape[1],
         chunk_size=args.chunk_size,
-        d_model=DEFAULT_D_MODEL,
-        depth=args.depth,
+        d_model=d_model,
+        depth=depth,
     ).to(device)
+    print(f"Model config: d_model={d_model}, depth={depth}")
 
-    if args.checkpoint is not None:
-        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        print(f"Loaded model weights from checkpoint: {args.checkpoint}")
+    if checkpoint_meta is not None:
+        initialize_model_from_checkpoint(
+            model,
+            checkpoint_meta,
+            load_mode=args.checkpoint_load_mode,
+        )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
@@ -263,6 +409,7 @@ def main() -> None:
 
     # ── training loop ─────────────────────────────────────────────────
     best_val = float("inf")
+    epochs_without_improvement = 0
 
     # Derive action space tag from action keys (e.g. "ee_xyz", "joints")
     action_space = "unknown"
@@ -317,8 +464,8 @@ def main() -> None:
                 "action_std": normalizer.action_std,
             },
             "chunk_size": args.chunk_size,
-            "d_model": DEFAULT_D_MODEL,
-            "depth": args.depth,
+            "d_model": d_model,
+            "depth": depth,
             "policy_type": args.policy,
             "state_keys": state_keys,
             "action_keys": action_keys,
@@ -326,19 +473,33 @@ def main() -> None:
             "action_dim": int(actions.shape[1]),
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "data_augmentation": data_augmentation,
+            "init_checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
+            "checkpoint_load_mode": args.checkpoint_load_mode if args.checkpoint is not None else None,
         }
         torch.save(checkpoint, last_save_path)
 
         tag = ""
         if val_loss < best_val:
             best_val = val_loss
+            epochs_without_improvement = 0
             torch.save(checkpoint, best_save_path)
             tag = " saved"
+        else:
+            epochs_without_improvement += 1
 
         print(
             f"Epoch {epoch:3d}/{args.epochs} | "
-            f"train {train_loss:.6f} | val {val_loss:.6f} | lr {lr:.2e}{tag}"
+            f"train {train_loss:.6f} | val {val_loss:.6f} | lr {lr:.2e}"
+            f" | patience {epochs_without_improvement}/{args.patience}{tag}"
         )
+
+        if epochs_without_improvement >= args.patience:
+            print(
+                f"Early stopping at epoch {epoch}: no validation improvement for "
+                f"{args.patience} consecutive epoch(s)."
+            )
+            break
 
     print(f"\nBest val loss: {best_val:.6f}")
     print(f"Best checkpoint: {best_save_path}")
