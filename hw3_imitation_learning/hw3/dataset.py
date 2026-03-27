@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import permutations
 from pathlib import Path
 
 import numpy as np
 import torch
 import zarr
 from torch.utils.data import Dataset
+
+
+COLOR_PERMUTATIONS: tuple[tuple[int, int, int], ...] = tuple(permutations(range(3)))
 
 
 @dataclass(frozen=True)
@@ -60,6 +64,127 @@ def _parse_key_spec(spec: str) -> tuple[str, slice]:
     raise ValueError(
         f"Invalid key spec: {spec!r}  (expected 'key', 'key[:N]', 'key[M:]', or 'key[M:N]')"
     )
+
+
+def _slice_width(width: int, col_slice: slice) -> int:
+    """Return the resulting width after applying ``col_slice``."""
+    return len(range(width)[col_slice])
+
+
+@dataclass(frozen=True)
+class ColorPermutationSpec:
+    """Resolved state slices needed for multicube color-permutation augmentation."""
+
+    cube_slices: tuple[slice, slice, slice]
+    goal_slice: slice
+
+
+def resolve_state_feature_slices(
+    state_keys: list[str],
+    key_widths: dict[str, int],
+) -> dict[str, list[slice]]:
+    """Resolve concatenated state-vector slices for the configured ``state_keys``."""
+    offset = 0
+    resolved: dict[str, list[slice]] = {}
+
+    for spec in state_keys:
+        name, col_slice = _parse_key_spec(spec)
+        if name not in key_widths:
+            raise ValueError(f"State key {name!r} was not found in the zarr data arrays.")
+
+        width = _slice_width(key_widths[name], col_slice)
+        current = slice(offset, offset + width)
+        resolved.setdefault(name, []).append(current)
+        offset += width
+
+    return resolved
+
+
+def build_color_permutation_spec(
+    state_keys: list[str],
+    key_widths: dict[str, int],
+) -> ColorPermutationSpec:
+    """Validate multicube augmentation inputs and resolve their state slices."""
+    required_keys = (
+        "original_pos_cube_red",
+        "original_pos_cube_green",
+        "original_pos_cube_blue",
+        "state_goal",
+    )
+    resolved = resolve_state_feature_slices(state_keys, key_widths)
+
+    missing = [name for name in required_keys if name not in resolved]
+    if missing:
+        raise ValueError(
+            "Multicube color augmentation requires state_keys to include "
+            f"{list(required_keys)}. Missing: {missing}."
+        )
+
+    duplicated = [name for name in required_keys if len(resolved[name]) != 1]
+    if duplicated:
+        raise ValueError(
+            "Multicube color augmentation expects exactly one state-key entry for "
+            f"each required input. Ambiguous entries: {duplicated}."
+        )
+
+    cube_slices = (
+        resolved["original_pos_cube_red"][0],
+        resolved["original_pos_cube_green"][0],
+        resolved["original_pos_cube_blue"][0],
+    )
+    cube_widths = [sl.stop - sl.start for sl in cube_slices]
+    if len(set(cube_widths)) != 1:
+        raise ValueError(
+            "Multicube color augmentation requires the red/green/blue cube state "
+            f"slices to have identical widths after slicing. Got: {cube_widths}."
+        )
+
+    goal_slice = resolved["state_goal"][0]
+    goal_width = goal_slice.stop - goal_slice.start
+    if goal_width != 3:
+        raise ValueError(
+            "Multicube color augmentation requires state_goal to remain width 3. "
+            f"Got width {goal_width}."
+        )
+
+    return ColorPermutationSpec(cube_slices=cube_slices, goal_slice=goal_slice)
+
+
+def permute_color_conditioned_state(
+    state: torch.Tensor,
+    permutation: tuple[int, int, int],
+    spec: ColorPermutationSpec,
+    *,
+    state_mean: torch.Tensor | None = None,
+    state_std: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return a copy of ``state`` with multicube color channels permuted."""
+    if state.ndim != 1:
+        raise ValueError(f"Expected a flat state vector, got shape {tuple(state.shape)}.")
+    if (state_mean is None) != (state_std is None):
+        raise ValueError("state_mean and state_std must either both be set or both be None.")
+
+    out = state.clone()
+    cube_values = [state[sl].clone() for sl in spec.cube_slices]
+    goal_values = state[spec.goal_slice].clone()
+
+    if state_mean is None or state_std is None:
+        for dest_idx, src_idx in enumerate(permutation):
+            out[spec.cube_slices[dest_idx]] = cube_values[src_idx]
+        out[spec.goal_slice] = goal_values[list(permutation)]
+        return out
+
+    cube_means = [state_mean[sl] for sl in spec.cube_slices]
+    cube_stds = [state_std[sl] for sl in spec.cube_slices]
+    for dest_idx, src_idx in enumerate(permutation):
+        raw = cube_values[src_idx] * cube_stds[src_idx] + cube_means[src_idx]
+        out[spec.cube_slices[dest_idx]] = (raw - cube_means[dest_idx]) / cube_stds[dest_idx]
+
+    goal_mean = state_mean[spec.goal_slice]
+    goal_std = state_std[spec.goal_slice]
+    raw_goal = goal_values * goal_std + goal_mean
+    out[spec.goal_slice] = (raw_goal[list(permutation)] - goal_mean) / goal_std
+    return out
 
 
 def load_zarr(
@@ -208,3 +333,44 @@ class SO100ChunkDataset(Dataset):
         action_t = torch.from_numpy(action_chunk).float()
 
         return state_t, action_t
+
+
+class ColorPermutationAugmentedDataset(Dataset):
+    """Virtual training-set expansion over all 6 multicube color permutations."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        spec: ColorPermutationSpec,
+        normalizer: Normalizer | None,
+    ) -> None:
+        self.dataset = dataset
+        self.spec = spec
+        self.num_permutations = len(COLOR_PERMUTATIONS)
+        self.state_mean = (
+            torch.from_numpy(normalizer.state_mean).float()
+            if normalizer is not None
+            else None
+        )
+        self.state_std = (
+            torch.from_numpy(normalizer.state_std).float()
+            if normalizer is not None
+            else None
+        )
+
+    def __len__(self) -> int:
+        return len(self.dataset) * self.num_permutations
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        base_idx = idx // self.num_permutations
+        perm_idx = idx % self.num_permutations
+        state_t, action_t = self.dataset[base_idx]
+        state_aug = permute_color_conditioned_state(
+            state_t,
+            COLOR_PERMUTATIONS[perm_idx],
+            self.spec,
+            state_mean=self.state_mean,
+            state_std=self.state_std,
+        )
+        return state_aug, action_t
