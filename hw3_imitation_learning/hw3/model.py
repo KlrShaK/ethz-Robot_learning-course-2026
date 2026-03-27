@@ -24,17 +24,14 @@ class BasePolicy(nn.Module, metaclass=abc.ABCMeta):
         self.chunk_size = chunk_size
 
     @abc.abstractmethod
-    def compute_loss(
-        self, state: torch.Tensor, action_chunk: torch.Tensor
-    ) -> torch.Tensor:
+    def compute_loss(self, state: torch.Tensor, action_chunk: torch.Tensor) -> torch.Tensor:
         """Compute training loss for a batch."""
+        raise NotImplementedError
 
     @abc.abstractmethod
-    def sample_actions(
-        self,
-        state: torch.Tensor,
-    ) -> torch.Tensor:
+    def sample_actions(self, state: torch.Tensor) -> torch.Tensor:
         """Generate a chunk of actions with shape (batch, chunk_size, action_dim)."""
+        raise NotImplementedError
 
 
 def _init_linear(linear: nn.Linear) -> None:

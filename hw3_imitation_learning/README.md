@@ -1,5 +1,5 @@
 # Imitation Learning
-**DEADLINE: 24th March 2026 23.59**
+**DEADLINE: 26th March 2026 23.59**
 ---
 
 ## Introduction
@@ -122,9 +122,10 @@ Submit your `model.py` and your best checkpoint `.pt` file to the autograder. Pl
 - Depending on how easy this exercise is for you, you might or might not see why DAgger can be a very useful tool but very ressource-intensive in practice as well
 
 
-### Exercise 3: Multicube Goal-Conditioned Imitation Learning
+### Exercise 3 (Competition!): Multicube Goal-Conditioned Imitation Learning
 
 In this exercise, you train a goal-conditioned policy that can solve multiple tasks using the same policy. Instead of learning a single behavior, the robot receives task information as input and must act accordingly.
+There is a leaderboard on gradescope.
 
 #### Task Description
 
