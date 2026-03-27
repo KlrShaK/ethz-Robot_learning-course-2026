@@ -34,6 +34,7 @@ from hw3.teleop_utils import (
 from so101_gym.constants import ASSETS_DIR
 
 MOCAP_INDEX = 0
+MIRRORED_DISPLAY_CAMERAS: frozenset[str] = frozenset({"left_wrist"})
 CUBE_JOINT_NAMES: tuple[str, ...] = (
     "red_box_joint",
     "green_box_joint",
@@ -171,6 +172,11 @@ class BaseCv2TeleopRecorder:
 
     def _compose_views(self) -> np.ndarray:
         images = {cam: self._render_bgr(cam) for cam in CAMERA_NAMES}
+        for cam in MIRRORED_DISPLAY_CAMERAS:
+            if cam in images:
+                # Mirror only the operator display so left/right motion matches
+                # what the user expects without affecting the recorded data.
+                images[cam] = cv2.flip(images[cam], 1)
         return compose_camera_views(images, CAMERA_NAMES)
 
     def _label_for(self, action: str) -> str:
